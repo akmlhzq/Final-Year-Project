@@ -1,106 +1,156 @@
 #include <Arduino.h>
 
-// Works with ESP32 Arduino core 2.x (PlatformIO: platform = espressif32@6.9.0)
+// ---------- BTS7960 driver 1 ----------
+const int RPWM1 = 25;
+const int LPWM1 = 26;
+const int EN1   = 14;   // R_EN + L_EN tied together
 
+// ---------- BTS7960 driver 2 ----------
+const int RPWM2 = 32;
+const int LPWM2 = 33;
+const int EN2   = 5;    // R_EN + L_EN tied together (GPIO5 is HIGH at boot)
+
+// ---------- Relays (active LOW) ----------
+const int RELAY1 = 4;
+const int RELAY3 = 13;
+const int RELAY4 = 18;
+
+// ---------- PWM settings ----------
+const int PWM_FREQ = 20000;   // 20 kHz, above audible range
+const int PWM_BITS = 8;       // duty 0..255
+
+// Speed trim per motor (use to compensate RPM difference)
+const float TRIM1 = 0.6;
+const float TRIM2 = 0.6;
+
+// Direction per motor: 1 = normal, -1 = flipped
+// If one motor spins the wrong way, change its value here
+const int DIR1 = 1;
+const int DIR2 = 1;
+
+// ---------- PWM helpers (work on ESP32 Arduino core 2.x and 3.x) ----------
+void pwmInit(int pin, int ch) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(pin, PWM_FREQ, PWM_BITS);
+#else
+  ledcSetup(ch, PWM_FREQ, PWM_BITS);
+  ledcAttachPin(pin, ch);
+#endif
+}
+
+void pwmWrite(int pin, int ch, int duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, duty);
+#else
+  ledcWrite(ch, duty);
+#endif
+}
+
+// ---------- Motor ----------
 struct Motor {
-  int rpwm, lpwm, ren, len;
-  int chFwd, chRev;
-  bool invert;   // true = flip this motor's direction
+  int rpwm, lpwm, en;
+  int chR, chL;
+  float trim;
+  int dir;
 };
 
-//              RPWM LPWM R_EN L_EN chF chR invert
-Motor motor1 = {25,  26,  27,  14,  0,   1,  false};
-Motor motor2 = {32,  33,  18,  19,  2,   3,  false};
-
-// ===== SETTINGS: change these =====
-// Motor 1
-const int   M1_FWD_SPEED = 100;    // percent (0-100)
-const float M1_FWD_TIME  = 5.0;   // seconds
-const int   M1_REV_SPEED = 60;
-const float M1_REV_TIME  = 5.0;
-
-// Motor 2
-const int   M2_FWD_SPEED = 100;
-const float M2_FWD_TIME  = 5.0;
-const int   M2_REV_SPEED = 60;
-const float M2_REV_TIME  = 5.0;
-
-// Both motors together
-const int   BOTH_SPEED   = 100;
-const float BOTH_TIME    = 4.0;
-
-const float PAUSE        = 1.0;   // stop time between moves, seconds
-const int   REPEAT_COUNT = 4;     // how many times to repeat everything (0 = forever)
-// ==================================
+Motor m1 = {RPWM1, LPWM1, EN1, 0, 1, TRIM1, DIR1};
+Motor m2 = {RPWM2, LPWM2, EN2, 2, 3, TRIM2, DIR2};
 
 void motorInit(Motor &m) {
-  pinMode(m.ren, OUTPUT);
-  pinMode(m.len, OUTPUT);
-  digitalWrite(m.ren, HIGH);
-  digitalWrite(m.len, HIGH);
-  ledcSetup(m.chFwd, 20000, 8);   // 20 kHz, 8-bit
-  ledcSetup(m.chRev, 20000, 8);
-  ledcAttachPin(m.rpwm, m.chFwd);
-  ledcAttachPin(m.lpwm, m.chRev);
+  pinMode(m.en, OUTPUT);
+  digitalWrite(m.en, LOW);              // disabled while PWM is set up
+  pwmInit(m.rpwm, m.chR);
+  pwmInit(m.lpwm, m.chL);
+  pwmWrite(m.rpwm, m.chR, 0);
+  pwmWrite(m.lpwm, m.chL, 0);
+  digitalWrite(m.en, HIGH);             // enable driver, motor stopped
 }
 
-// percent: 0-100, forward: true = forward, false = reverse
-void motorRun(Motor &m, int percent, bool forward) {
-  if (m.invert) forward = !forward;
-  int duty = map(constrain(percent, 0, 100), 0, 100, 0, 255);
-  ledcWrite(m.chFwd, forward ? duty : 0);
-  ledcWrite(m.chRev, forward ? 0 : duty);
-}
-
-void motorStop(Motor &m) {
-  ledcWrite(m.chFwd, 0);
-  ledcWrite(m.chRev, 0);
-}
-
-// Run one motor in one direction for a time, then stop and pause
-void runStep(Motor &m, int percent, bool forward, float seconds) {
-  motorRun(m, percent, forward);
-  delay(seconds * 1000);
-  motorStop(m);
-  delay(PAUSE * 1000);
-}
-
-// Run both motors together in one direction for a time, then stop and pause
-void runBoth(int percent, bool forward, float seconds) {
-  motorRun(motor1, percent, forward);
-  motorRun(motor2, percent, forward);
-  delay(seconds * 1000);
-  motorStop(motor1);
-  motorStop(motor2);
-  delay(PAUSE * 1000);
-}
-
-void setup() {
-  motorInit(motor1);
-  motorInit(motor2);
-
-  int cycles = 0;
-  while (REPEAT_COUNT == 0 || cycles < REPEAT_COUNT) {
-    // Motor 1: forward then reverse
-    runStep(motor1, M1_FWD_SPEED, true,  M1_FWD_TIME);
-    runStep(motor1, M1_REV_SPEED, false, M1_REV_TIME);
-
-    // Motor 2: forward then reverse
-    runStep(motor2, M2_FWD_SPEED, true,  M2_FWD_TIME);
-    runStep(motor2, M2_REV_SPEED, false, M2_REV_TIME);
-
-    // Both together: forward then reverse
-    runBoth(BOTH_SPEED, true,  BOTH_TIME);
-    runBoth(BOTH_SPEED, false, BOTH_TIME);
-
-    cycles++;
+// speed: -255 (full reverse) .. 0 (stop) .. +255 (full forward)
+void motorSet(Motor &m, int speed) {
+  speed = constrain((int)(speed * m.trim * m.dir), -255, 255);
+  if (speed > 0) {
+    pwmWrite(m.lpwm, m.chL, 0);         // never drive both sides at once
+    pwmWrite(m.rpwm, m.chR, speed);
+  } else if (speed < 0) {
+    pwmWrite(m.rpwm, m.chR, 0);
+    pwmWrite(m.lpwm, m.chL, -speed);
+  } else {
+    pwmWrite(m.rpwm, m.chR, 0);
+    pwmWrite(m.lpwm, m.chL, 0);
   }
+}
 
-  motorStop(motor1);
-  motorStop(motor2);
+// ---------- Relays (non-blocking: ON 10 s, OFF 5 s) ----------
+const unsigned long RELAY_ON_MS  = 10000;   // relays ON time
+const unsigned long RELAY_OFF_MS = 5000;    // relays OFF time
+bool relaysOn = false;
+unsigned long relayTimer = 0;
+
+void relaysSet(bool on) {
+  int level = on ? LOW : HIGH;          // active LOW module
+  digitalWrite(RELAY1, level);
+  digitalWrite(RELAY3, level);
+  digitalWrite(RELAY4, level);
+}
+
+void updateRelays() {
+  unsigned long now = millis();
+  if (relaysOn && now - relayTimer >= RELAY_ON_MS) {
+    relaysSet(false);
+    relaysOn = false;
+    relayTimer = now;
+  } else if (!relaysOn && now - relayTimer >= RELAY_OFF_MS) {
+    relaysSet(true);
+    relaysOn = true;
+    relayTimer = now;
+  }
+}
+
+// ---------- Motor demo sequence (non-blocking) ----------
+const int SPEED = 128;                  // about 50%
+
+struct Step { int s1, s2; unsigned long ms; };
+Step steps[] = {
+  { SPEED,  SPEED, 5000},   // both motors forward
+  {     0,      0,  300},   // short pause before changing direction
+  {-SPEED, -SPEED, 5000},   // both motors reverse
+  {     0,      0,  300},
+};
+const int NUM_STEPS = sizeof(steps) / sizeof(steps[0]);
+int stepIndex = 0;
+unsigned long stepTimer = 0;
+
+void applyStep(int i) {
+  motorSet(m1, steps[i].s1);
+  motorSet(m2, steps[i].s2);
+}
+
+void updateMotors() {
+  if (millis() - stepTimer >= steps[stepIndex].ms) {
+    stepIndex = (stepIndex + 1) % NUM_STEPS;
+    stepTimer = millis();
+    applyStep(stepIndex);
+  }
+}
+
+// ---------- Arduino ----------
+void setup() {
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT);
+  relaysSet(true);                      // start with relays ON
+  relaysOn = true;
+  relayTimer = millis();
+
+  motorInit(m1);
+  motorInit(m2);
+  stepTimer = millis();
+  applyStep(0);
 }
 
 void loop() {
-  // nothing, the sequence runs in setup()
-  // press the ESP32 EN (reset) button to run it again
+  updateRelays();
+  updateMotors();
 }
