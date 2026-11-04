@@ -1,156 +1,376 @@
 #include <Arduino.h>
+#include <esp_arduino_version.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
 
-// ---------- BTS7960 driver 1 ----------
+// ===== YOUR WHEEL DRIVER PINS =====
 const int RPWM1 = 25;
 const int LPWM1 = 26;
-const int EN1   = 14;   // R_EN + L_EN tied together
+const int EN1   = 14;
 
-// ---------- BTS7960 driver 2 ----------
 const int RPWM2 = 32;
 const int LPWM2 = 33;
-const int EN2   = 5;    // R_EN + L_EN tied together (GPIO5 is HIGH at boot)
+const int EN2   = 5;
 
-// ---------- Relays (active LOW) ----------
-const int RELAY1 = 4;
-const int RELAY3 = 13;
-const int RELAY4 = 18;
+const char FIRMWARE_BUILD[] = "wheels_only_r3";
 
-// ---------- PWM settings ----------
-const int PWM_FREQ = 20000;   // 20 kHz, above audible range
-const int PWM_BITS = 8;       // duty 0..255
+const int PWM_FREQ = 20000;
+const int PWM_BITS = 8;
 
-// Speed trim per motor (use to compensate RPM difference)
-const float TRIM1 = 0.6;
-const float TRIM2 = 0.6;
+const float TRIM1 = 1.0f;
+const float TRIM2 = 1.0f;
 
-// Direction per motor: 1 = normal, -1 = flipped
-// If one motor spins the wrong way, change its value here
+// Change the affected direction to -1 if a wheel runs backward.
 const int DIR1 = 1;
 const int DIR2 = 1;
 
-// ---------- PWM helpers (work on ESP32 Arduino core 2.x and 3.x) ----------
-void pwmInit(int pin, int ch) {
+const uint32_t COMMAND_TIMEOUT_MS = 500;
+const uint32_t REVERSE_PAUSE_MS = 100;
+
+// ===== PWM: ESP32 ARDUINO CORE 2.x AND 3.x =====
+bool pwmInit(int pin, int channel) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(pin, PWM_FREQ, PWM_BITS);
+  return ledcAttach(pin, PWM_FREQ, PWM_BITS);
 #else
-  ledcSetup(ch, PWM_FREQ, PWM_BITS);
-  ledcAttachPin(pin, ch);
+  if (ledcSetup(channel, PWM_FREQ, PWM_BITS) == 0) {
+    return false;
+  }
+  ledcAttachPin(pin, channel);
+  return true;
 #endif
 }
 
-void pwmWrite(int pin, int ch, int duty) {
+void pwmWrite(int pin, int channel, int duty) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(pin, duty);
 #else
-  ledcWrite(ch, duty);
+  ledcWrite(channel, duty);
 #endif
 }
 
-// ---------- Motor ----------
+// ===== WHEEL MOTOR =====
 struct Motor {
   int rpwm, lpwm, en;
-  int chR, chL;
+  int channelR, channelL;
   float trim;
-  int dir;
+  int direction;
+  int output;
+  int lastDirection;
+  uint32_t stoppedAt;
+
+  bool begin() {
+    pinMode(en, OUTPUT);
+    digitalWrite(en, LOW);
+
+    bool r = pwmInit(rpwm, channelR);
+    bool l = pwmInit(lpwm, channelL);
+
+    if (r) pwmWrite(rpwm, channelR, 0);
+    if (l) pwmWrite(lpwm, channelL, 0);
+
+    return r && l;
+  }
+
+  void stop() {
+    digitalWrite(en, LOW);
+    pwmWrite(rpwm, channelR, 0);
+    pwmWrite(lpwm, channelL, 0);
+
+    if (output != 0) {
+      stoppedAt = millis();
+    }
+    output = 0;
+  }
+
+  void update(int requested, uint32_t now) {
+    int duty = static_cast<int>(
+      requested * trim * direction
+    );
+
+    if (duty > 255) duty = 255;
+    if (duty < -255) duty = -255;
+
+    if (duty == 0) {
+      stop();
+      return;
+    }
+
+    int sign = duty > 0 ? 1 : -1;
+
+    // Non-blocking pause before reversing.
+    if (lastDirection != 0 && sign != lastDirection) {
+      if (output != 0) {
+        stop();
+        return;
+      }
+
+      if (static_cast<uint32_t>(now - stoppedAt)
+          < REVERSE_PAUSE_MS) {
+        return;
+      }
+    }
+
+    if (output == duty) return;
+
+    if (duty > 0) {
+      pwmWrite(lpwm, channelL, 0);
+      pwmWrite(rpwm, channelR, duty);
+    } else {
+      pwmWrite(rpwm, channelR, 0);
+      pwmWrite(lpwm, channelL, -duty);
+    }
+
+    digitalWrite(en, HIGH);
+    output = duty;
+    lastDirection = sign;
+  }
 };
 
-Motor m1 = {RPWM1, LPWM1, EN1, 0, 1, TRIM1, DIR1};
-Motor m2 = {RPWM2, LPWM2, EN2, 2, 3, TRIM2, DIR2};
-
-void motorInit(Motor &m) {
-  pinMode(m.en, OUTPUT);
-  digitalWrite(m.en, LOW);              // disabled while PWM is set up
-  pwmInit(m.rpwm, m.chR);
-  pwmInit(m.lpwm, m.chL);
-  pwmWrite(m.rpwm, m.chR, 0);
-  pwmWrite(m.lpwm, m.chL, 0);
-  digitalWrite(m.en, HIGH);             // enable driver, motor stopped
-}
-
-// speed: -255 (full reverse) .. 0 (stop) .. +255 (full forward)
-void motorSet(Motor &m, int speed) {
-  speed = constrain((int)(speed * m.trim * m.dir), -255, 255);
-  if (speed > 0) {
-    pwmWrite(m.lpwm, m.chL, 0);         // never drive both sides at once
-    pwmWrite(m.rpwm, m.chR, speed);
-  } else if (speed < 0) {
-    pwmWrite(m.rpwm, m.chR, 0);
-    pwmWrite(m.lpwm, m.chL, -speed);
-  } else {
-    pwmWrite(m.rpwm, m.chR, 0);
-    pwmWrite(m.lpwm, m.chL, 0);
-  }
-}
-
-// ---------- Relays (non-blocking: ON 10 s, OFF 5 s) ----------
-const unsigned long RELAY_ON_MS  = 10000;   // relays ON time
-const unsigned long RELAY_OFF_MS = 5000;    // relays OFF time
-bool relaysOn = false;
-unsigned long relayTimer = 0;
-
-void relaysSet(bool on) {
-  int level = on ? LOW : HIGH;          // active LOW module
-  digitalWrite(RELAY1, level);
-  digitalWrite(RELAY3, level);
-  digitalWrite(RELAY4, level);
-}
-
-void updateRelays() {
-  unsigned long now = millis();
-  if (relaysOn && now - relayTimer >= RELAY_ON_MS) {
-    relaysSet(false);
-    relaysOn = false;
-    relayTimer = now;
-  } else if (!relaysOn && now - relayTimer >= RELAY_OFF_MS) {
-    relaysSet(true);
-    relaysOn = true;
-    relayTimer = now;
-  }
-}
-
-// ---------- Motor demo sequence (non-blocking) ----------
-const int SPEED = 128;                  // about 50%
-
-struct Step { int s1, s2; unsigned long ms; };
-Step steps[] = {
-  { SPEED,  SPEED, 5000},   // both motors forward
-  {     0,      0,  300},   // short pause before changing direction
-  {-SPEED, -SPEED, 5000},   // both motors reverse
-  {     0,      0,  300},
+Motor wheelL = {
+  RPWM1, LPWM1, EN1, 0, 1,
+  TRIM1, DIR1, 0, 0, 0
 };
-const int NUM_STEPS = sizeof(steps) / sizeof(steps[0]);
-int stepIndex = 0;
-unsigned long stepTimer = 0;
 
-void applyStep(int i) {
-  motorSet(m1, steps[i].s1);
-  motorSet(m2, steps[i].s2);
+Motor wheelR = {
+  RPWM2, LPWM2, EN2, 2, 3,
+  TRIM2, DIR2, 0, 0, 0
+};
+
+bool pwmReady = false;
+bool commandActive = false;
+
+int targetL = 0;
+int targetR = 0;
+
+uint32_t lastCommandAt = 0;
+
+char rxLine[64];
+size_t rxLength = 0;
+bool discardLine = false;
+
+// ===== STOP =====
+void stopAll() {
+  targetL = 0;
+  targetR = 0;
+  commandActive = false;
+
+  if (pwmReady) {
+    wheelL.stop();
+    wheelR.stop();
+  }
+
+  digitalWrite(EN1, LOW);
+  digitalWrite(EN2, LOW);
 }
 
-void updateMotors() {
-  if (millis() - stepTimer >= steps[stepIndex].ms) {
-    stepIndex = (stepIndex + 1) % NUM_STEPS;
-    stepTimer = millis();
-    applyStep(stepIndex);
+// ===== SERIAL PARSER =====
+// Compatible with Python commands:
+// left_speed right_speed 0 0
+//
+// The last two fields are reserved and must be zero.
+bool parseValues(const char *text, int values[4]) {
+  const char *p = text;
+
+  for (int i = 0; i < 4; ++i) {
+    while (isspace(static_cast<unsigned char>(*p))) {
+      ++p;
+    }
+
+    const char *start = p;
+
+    if (*p == '+' || *p == '-') {
+      ++p;
+    }
+
+    const char *digits = p;
+
+    while (isdigit(static_cast<unsigned char>(*p))) {
+      ++p;
+    }
+
+    if (p == digits || p - digits > 3) {
+      return false;
+    }
+
+    if (*p && !isspace(static_cast<unsigned char>(*p))) {
+      return false;
+    }
+
+    long value = strtol(start, nullptr, 10);
+
+    if (value < -255 || value > 255) {
+      return false;
+    }
+
+    values[i] = static_cast<int>(value);
+  }
+
+  while (isspace(static_cast<unsigned char>(*p))) {
+    ++p;
+  }
+
+  return *p == '\0';
+}
+
+void handleLine(char *line) {
+  while (isspace(static_cast<unsigned char>(*line))) {
+    ++line;
+  }
+
+  size_t n = strlen(line);
+
+  while (n &&
+         isspace(static_cast<unsigned char>(line[n - 1]))) {
+    line[--n] = '\0';
+  }
+
+  if (!n) return;
+
+  if (strcmp(line, "STOP") == 0) {
+    stopAll();
+    Serial.println("OK STOP");
+    return;
+  }
+
+  if (strcmp(line, "PING") == 0) {
+    stopAll();
+    Serial.println(
+      pwmReady
+        ? "PONG robot_wheels_v1"
+        : "ERR PWM_INIT"
+    );
+    return;
+  }
+
+  if (strcmp(line, "STATUS") == 0) {
+    Serial.printf(
+      "STATUS target=%d,%d pwm=%d,%d ready=%d build=%s\n",
+      targetL, targetR,
+      wheelL.output, wheelR.output,
+      pwmReady, FIRMWARE_BUILD
+    );
+    return;
+  }
+
+  int values[4];
+
+  if (!parseValues(line, values)) {
+    stopAll();
+    Serial.println("ERR EXPECT_4_INTS_-255_TO_255");
+    return;
+  }
+
+  if (values[2] != 0 || values[3] != 0) {
+    stopAll();
+    Serial.println("ERR RESERVED_FIELDS_MUST_BE_ZERO");
+    return;
+  }
+
+  if (!pwmReady) {
+    stopAll();
+    Serial.println("ERR PWM_INIT");
+    return;
+  }
+
+  targetL = values[0];
+  targetR = values[1];
+
+  lastCommandAt = millis();
+  commandActive = (targetL != 0 || targetR != 0);
+
+  if (!commandActive) {
+    stopAll();
+  }
+
+  Serial.printf(
+    "OK %d %d 0 0\n",
+    values[0], values[1]
+  );
+}
+
+void readSerial() {
+  for (int budget = 0;
+       budget < 64 && Serial.available();
+       ++budget) {
+
+    char c = static_cast<char>(Serial.read());
+
+    if (c == '\n') {
+      if (!discardLine) {
+        rxLine[rxLength] = '\0';
+        handleLine(rxLine);
+      }
+
+      rxLength = 0;
+      discardLine = false;
+
+    } else if (!discardLine) {
+      unsigned char u = static_cast<unsigned char>(c);
+
+      if ((u < 32 && c != '\t' && c != '\r') ||
+          u > 126 ||
+          rxLength >= sizeof(rxLine) - 1) {
+
+        stopAll();
+        discardLine = true;
+        rxLength = 0;
+
+        Serial.println("ERR BAD_OR_LONG_LINE");
+      } else {
+        rxLine[rxLength++] = c;
+      }
+    }
   }
 }
 
-// ---------- Arduino ----------
+// ===== COMMUNICATION TIMEOUT =====
+void checkTimeout() {
+  if (commandActive &&
+      static_cast<uint32_t>(millis() - lastCommandAt)
+        >= COMMAND_TIMEOUT_MS) {
+
+    stopAll();
+    Serial.println("STOP TIMEOUT");
+  }
+}
+
+// ===== STARTUP =====
 void setup() {
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY3, OUTPUT);
-  pinMode(RELAY4, OUTPUT);
-  relaysSet(true);                      // start with relays ON
-  relaysOn = true;
-  relayTimer = millis();
+  pinMode(EN1, OUTPUT);
+  digitalWrite(EN1, LOW);
 
-  motorInit(m1);
-  motorInit(m2);
-  stepTimer = millis();
-  applyStep(0);
+  pinMode(EN2, OUTPUT);
+  digitalWrite(EN2, LOW);
+
+  Serial.begin(115200);
+
+  bool leftOK = wheelL.begin();
+  bool rightOK = wheelR.begin();
+
+  pwmReady = leftOK && rightOK;
+  stopAll();
+
+  Serial.printf("INFO build=%s\n", FIRMWARE_BUILD);
+
+  Serial.println(
+    pwmReady
+      ? "READY robot_wheels_v1"
+      : "ERR PWM_INIT"
+  );
 }
 
+// ===== MAIN LOOP =====
 void loop() {
-  updateRelays();
-  updateMotors();
+  checkTimeout();
+  readSerial();
+  checkTimeout();
+
+  if (pwmReady && commandActive) {
+    uint32_t now = millis();
+    wheelL.update(targetL, now);
+    wheelR.update(targetR, now);
+  }
+
+  delay(1);
 }
