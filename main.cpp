@@ -4,7 +4,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ===== YOUR WHEEL DRIVER PINS =====
+// ===== RELAY PINS (match the wiring table) =====
+const int RELAY1 = 13;   // mop motor (IN1)
+const int RELAY2 = 19;   // light (IN2)
+const int RELAY3 = 4;    // mop motor (IN3)
+const int RELAY4 = 18;   // water motor (IN4)
+const int RELAY5 = 2;    // underlight (IN5)
+
+// In this robot HIGH = relay ON, LOW = relay OFF.
+// If your relay module works the opposite way, swap these two lines only.
+const int RELAY_ON  = HIGH;
+const int RELAY_OFF = LOW;
+
+// ===== WHEEL DRIVER PINS =====
 const int RPWM1 = 25;
 const int LPWM1 = 26;
 const int EN1   = 14;
@@ -13,20 +25,25 @@ const int RPWM2 = 32;
 const int LPWM2 = 33;
 const int EN2   = 5;
 
-const char FIRMWARE_BUILD[] = "wheels_only_r3";
+const char FIRMWARE_BUILD[] = "wheels_mop_r4";
 
 const int PWM_FREQ = 20000;
 const int PWM_BITS = 8;
 
-const float TRIM1 = 1.0f;
-const float TRIM2 = 1.0f;
+// Wheel speed: 1.0 was the old setting, 0.85 = 15% slower.
+// Change these two numbers to make the wheels faster or slower.
+const float TRIM1 = 0.85f;
+const float TRIM2 = 0.85f;
 
 // Change the affected direction to -1 if a wheel runs backward.
 const int DIR1 = 1;
 const int DIR2 = 1;
 
 const uint32_t COMMAND_TIMEOUT_MS = 500;
-const uint32_t REVERSE_PAUSE_MS = 100;
+const uint32_t REVERSE_PAUSE_MS   = 100;
+
+// Mop motors stay ON this long after the wheels stop.
+const uint32_t MOP_OFF_DELAY_MS = 3000;
 
 // ===== PWM: ESP32 ARDUINO CORE 2.x AND 3.x =====
 bool pwmInit(int pin, int channel) {
@@ -47,6 +64,36 @@ void pwmWrite(int pin, int channel, int duty) {
 #else
   ledcWrite(channel, duty);
 #endif
+}
+
+// ===== RELAY HELPERS =====
+// Set the level first, then make the pin an output.
+// This avoids a short click on the relay during boot.
+void relayInit(int pin, int level) {
+  digitalWrite(pin, level);
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, level);
+}
+
+// States of the relays (used by STATUS and by the database later)
+bool lightOn = true;    // relay 2 + 5: stays ON for now (database later)
+bool waterOn = false;   // relay 4: stays OFF for now (database later)
+bool mopOn   = false;   // relay 1 + 3: follows the wheels
+
+void applyLights() {
+  int level = lightOn ? RELAY_ON : RELAY_OFF;
+  digitalWrite(RELAY2, level);
+  digitalWrite(RELAY5, level);
+}
+
+void applyWater() {
+  digitalWrite(RELAY4, waterOn ? RELAY_ON : RELAY_OFF);
+}
+
+void applyMop() {
+  int level = mopOn ? RELAY_ON : RELAY_OFF;
+  digitalWrite(RELAY1, level);   // relay 1 and 3 always switch together
+  digitalWrite(RELAY3, level);
 }
 
 // ===== WHEEL MOTOR =====
@@ -144,12 +191,13 @@ int targetL = 0;
 int targetR = 0;
 
 uint32_t lastCommandAt = 0;
+uint32_t lastMoveAt = 0;     // last time a wheel was moving
 
 char rxLine[64];
 size_t rxLength = 0;
 bool discardLine = false;
 
-// ===== STOP =====
+// ===== STOP (wheels only, relays are handled by updateMop) =====
 void stopAll() {
   targetL = 0;
   targetR = 0;
@@ -162,6 +210,25 @@ void stopAll() {
 
   digitalWrite(EN1, LOW);
   digitalWrite(EN2, LOW);
+}
+
+// ===== MOP LOGIC =====
+// Wheels moving      -> mop relays ON right away
+// Wheels stopped     -> mop relays OFF after MOP_OFF_DELAY_MS (3 s)
+void updateMop(uint32_t now) {
+  bool wheelsMoving = (wheelL.output != 0 || wheelR.output != 0);
+
+  if (wheelsMoving) {
+    lastMoveAt = now;
+    if (!mopOn) {
+      mopOn = true;
+      applyMop();
+    }
+  } else if (mopOn &&
+             static_cast<uint32_t>(now - lastMoveAt) >= MOP_OFF_DELAY_MS) {
+    mopOn = false;
+    applyMop();
+  }
 }
 
 // ===== SERIAL PARSER =====
@@ -245,10 +312,10 @@ void handleLine(char *line) {
 
   if (strcmp(line, "STATUS") == 0) {
     Serial.printf(
-      "STATUS target=%d,%d pwm=%d,%d ready=%d build=%s\n",
+      "STATUS target=%d,%d pwm=%d,%d ready=%d mop=%d light=%d water=%d build=%s\n",
       targetL, targetR,
       wheelL.output, wheelR.output,
-      pwmReady, FIRMWARE_BUILD
+      pwmReady, mopOn, lightOn, waterOn, FIRMWARE_BUILD
     );
     return;
   }
@@ -337,6 +404,13 @@ void checkTimeout() {
 
 // ===== STARTUP =====
 void setup() {
+  // Relays: lights ON, mop OFF, water OFF
+  relayInit(RELAY2, lightOn ? RELAY_ON : RELAY_OFF);
+  relayInit(RELAY5, lightOn ? RELAY_ON : RELAY_OFF);
+  relayInit(RELAY1, RELAY_OFF);
+  relayInit(RELAY3, RELAY_OFF);
+  relayInit(RELAY4, waterOn ? RELAY_ON : RELAY_OFF);
+
   pinMode(EN1, OUTPUT);
   digitalWrite(EN1, LOW);
 
@@ -366,11 +440,14 @@ void loop() {
   readSerial();
   checkTimeout();
 
+  uint32_t now = millis();
+
   if (pwmReady && commandActive) {
-    uint32_t now = millis();
     wheelL.update(targetL, now);
     wheelR.update(targetR, now);
   }
+
+  updateMop(now);
 
   delay(1);
 }
