@@ -65,8 +65,8 @@ class LidarFollow(Node):
 
     # ---------------------------------------------------------------
     def send(self, left, right):
-        self.esp.write(f"{int(left)},{int(right)}\n".encode())
-
+        self.esp.write(f"{int(left)} {int(right)} 0 0\n".encode())
+      
     def find_target(self, scan: LaserScan):
         """Return (angle_deg, dist_m) of the nearest object in front, or None."""
         pts = []
